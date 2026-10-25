@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# wt: run several coding agents on one repo without them clobbering each other.
+# Each agent gets its own git worktree (folder + branch), its own env files,
+# its own deps, and can declare the files it plans to touch so overlaps
+# show up before work starts, not at merge time.
+#
+# Works with bash 3.2+ (macOS default) and git 2.20+.
+# MIT licence. https://github.com/kaimbuilds/agent-worktrees
+
+set -euo pipefail
+
+VERSION="0.1.0"
+BRANCH_PREFIX="${WT_BRANCH_PREFIX:-agent/}"
+PORT_BASE="${WT_PORT_BASE:-3100}"
+
+die()  { printf 'wt: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[32m›\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat <<'EOF'
+wt: one git worktree per coding agent
+
+Usage:
+  wt new <name> [--base <ref>] [--no-install] [--port]
+                         Create ../<repo>-<name> on branch agent/<name>,
+                         copy untracked .env* files, install deps.
+                         --port writes a unique PORT to .env.local.
+  wt ls                  List agent worktrees with branch, claims and status.
+  wt claim <name> <path>...
+                         Record the files/dirs agent <name> plans to touch.
+  wt claims              Show every agent's claims.
+  wt check               Exit 1 if two agents claim overlapping paths.
+  wt rm <name> [--delete-branch] [--force]
+                         Remove the worktree (and optionally its branch).
+  wt path <name>         Print the worktree path (e.g. cd "$(wt path auth)").
+  wt version | help
+
+Environment:
+  WT_DIR            Parent folder for worktrees (default: next to the repo)
+  WT_BRANCH_PREFIX  Branch prefix (default: agent/)
+  WT_PORT_BASE      First port handed out by --port (default: 3100)
+EOF
+}
+
+# ---- repo helpers ---------------------------------------------------------
+
+common_dir() {
+  # Absolute path to the shared .git dir, even when called from a worktree.
+  local c
+  c="$(git rev-parse --git-common-dir 2>/dev/null)" || die "not inside a git repository"
+  (cd "$c" && pwd)
+}
+
+main_root() {
+  # The main working tree (common dir is <main>/.git for non-bare repos).
+  (cd "$(common_dir)/.." && pwd)
+}
+
+state_dir() {
+  local d
+  d="$(common_dir)/wt"
+  mkdir -p "$d/claims" "$d/ports" "$d/copied"
+  printf '%s' "$d"
+}
+
+valid_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) die "invalid name '$1' (use letters, digits, . _ -)";;
+  esac
+}
+
+wt_path() {
+  local root name
+  root="$(main_root)"; name="$1"
+  printf '%s/%s-%s' "${WT_DIR:-$(dirname "$root")}" "$(basename "$root")" "$name"
+}
+
+install_deps() {
+  local dir="$1"
+  if   [ -f "$dir/pnpm-lock.yaml" ]; then cmd="pnpm install"
+  elif [ -f "$dir/bun.lockb" ] || [ -f "$dir/bun.lock" ]; then cmd="bun install"
+  elif [ -f "$dir/yarn.lock" ]; then cmd="yarn install"
+  elif [ -f "$dir/package-lock.json" ]; then cmd="npm ci"
+  elif [ -f "$dir/uv.lock" ]; then cmd="uv sync"
+  elif [ -f "$dir/poetry.lock" ]; then cmd="poetry install"
+  elif ls "$dir"/*.sln >/dev/null 2>&1; then cmd="dotnet restore"
+  else return 0
+  fi
+  local bin="${cmd%% *}"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    warn "found a lockfile for $bin but $bin is not installed; skipping deps"
+    return 0
+  fi
+  info "installing deps: $cmd"
+  (cd "$dir" && $cmd)
+}
+
+next_port() {
+  local sd="$1" p="$PORT_BASE"
+  while grep -qx "$p" "$sd"/ports/* 2>/dev/null; do p=$((p + 1)); done
+  printf '%s' "$p"
+}
+
+# ---- commands -------------------------------------------------------------
+
+cmd_new() {
+  local name="" base="HEAD" install=1 port=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) [ $# -ge 2 ] || die "--base needs a ref"; base="$2"; shift 2;;
+      --no-install) install=0; shift;;
+      --port) port=1; shift;;
+      -*) die "unknown option $1";;
+      *) [ -z "$name" ] || die "one name at a time"; name="$1"; shift;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: wt new <name>"
+  valid_name "$name"
+
+  local root dir branch sd
+  root="$(main_root)"; dir="$(wt_path "$name")"; branch="$BRANCH_PREFIX$name"; sd="$(state_dir)"
+  [ -e "$dir" ] && die "$dir already exists"
+
+  if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+    info "reusing existing branch $branch"
+    git -C "$root" worktree add "$dir" "$branch" >/dev/null
+  else
+    git -C "$root" worktree add -b "$branch" "$dir" "$base" >/dev/null
+  fi
+  info "worktree  $dir"
+  info "branch    $branch"
+
+  # Copy untracked env files (tracked ones are already in the checkout).
+  local f rel copied=0
+  for f in "$root"/.env "$root"/.env.*; do
+    [ -f "$f" ] || continue
+    rel="$(basename "$f")"
+    if ! git -C "$root" ls-files --error-unmatch "$rel" >/dev/null 2>&1; then
+      cp "$f" "$dir/$rel"; copied=$((copied + 1))
+      printf '%s\n' "$rel" >> "$sd/copied/$name"
+    fi
+  done
+  if [ "$copied" -gt 0 ]; then info "copied $copied env file(s)"; fi
+
+  if [ "$port" -eq 1 ]; then
+    local p; p="$(next_port "$sd")"
+    printf '%s\n' "$p" > "$sd/ports/$name"
+    printf 'PORT=%s\n' "$p" >> "$dir/.env.local"
+    printf '.env.local\n' >> "$sd/copied/$name"
+    info "port      $p (written to .env.local)"
+  fi
+
+  if [ "$install" -eq 1 ]; then install_deps "$dir"; fi
+
+  printf '\nNext:\n  cd %q && claude\n  wt claim %s <files it will touch>\n' "$dir" "$name"
+}
+
+cmd_ls() {
+  local sd root line path branch name claims dirty
+  sd="$(state_dir)"; root="$(main_root)"
+  printf '%-14s %-24s %-7s %s\n' NAME BRANCH STATUS CLAIMS
+  git -C "$root" worktree list --porcelain | while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) path="${line#worktree }";;
+      "branch refs/heads/$BRANCH_PREFIX"*)
+        branch="${line#branch refs/heads/}"; name="${branch#"$BRANCH_PREFIX"}"
+        if [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then dirty="dirty"; else dirty="clean"; fi
+        claims="-"
+        if [ -s "$sd/claims/$name" ]; then claims="$(tr '\n' ' ' < "$sd/claims/$name")"; fi
+        printf '%-14s %-24s %-7s %s\n' "$name" "$branch" "$dirty" "$claims";;
+    esac
+  done
+}
+
+normalise() {
+  # strip leading ./ and trailing /
+  local p="${1#./}"; p="${p%/}"; printf '%s' "$p"
+}
+
+cmd_claim() {
+  [ $# -ge 2 ] || die "usage: wt claim <name> <path>..."
+  local name="$1"; shift; valid_name "$name"
+  local sd; sd="$(state_dir)"
+  local p
+  for p in "$@"; do normalise "$p"; printf '\n'; done >> "$sd/claims/$name"
+  sort -u -o "$sd/claims/$name" "$sd/claims/$name"
+  info "$name claims: $(tr '\n' ' ' < "$sd/claims/$name")"
+  cmd_check || true
+}
+
+cmd_claims() {
+  local sd f; sd="$(state_dir)"
+  for f in "$sd"/claims/*; do
+    [ -s "$f" ] || continue
+    printf '%s: %s\n' "$(basename "$f")" "$(tr '\n' ' ' < "$f")"
+  done
+}
+
+overlaps() {
+  # true if path a equals b, or one is a directory prefix of the other
+  case "$1/" in "$2/"*) return 0;; esac
+  case "$2/" in "$1/"*) return 0;; esac
+  return 1
+}
+
+# shellcheck disable=SC2094  # warn writes to stderr, not the claim files
+cmd_check() {
+  local sd f g a b clash=0
+  sd="$(state_dir)"
+  for f in "$sd"/claims/*; do
+    [ -s "$f" ] || continue
+    for g in "$sd"/claims/*; do
+      [ -s "$g" ] || continue
+      [[ "$f" < "$g" ]] || continue
+      while IFS= read -r a; do
+        while IFS= read -r b; do
+          if overlaps "$a" "$b"; then
+            warn "overlap: $(basename "$f") ($a) vs $(basename "$g") ($b)"
+            clash=1
+          fi
+        done < "$g"
+      done < "$f"
+    done
+  done
+  if [ "$clash" -eq 1 ]; then
+    warn "don't run these agents in parallel; sequence them or split the work"
+    return 1
+  fi
+  info "no overlapping claims"
+}
+
+cmd_rm() {
+  local name="" delete=0 force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete-branch) delete=1; shift;;
+      --force) force="--force"; shift;;
+      -*) die "unknown option $1";;
+      *) name="$1"; shift;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: wt rm <name>"
+  valid_name "$name"
+  local root dir sd
+  root="$(main_root)"; dir="$(wt_path "$name")"; sd="$(state_dir)"
+  if [ -d "$dir" ]; then
+    # Refuse early if the agent left real changes (ignoring env files wt copied).
+    if [ -z "$force" ]; then
+      local changes
+      changes="$(git -C "$dir" status --porcelain | sed 's/^...//' | grep -vxF -f "$sd/copied/$name" 2>/dev/null || true)"
+      [ -f "$sd/copied/$name" ] || changes="$(git -C "$dir" status --porcelain)"
+      [ -z "$changes" ] || die "worktree has changes; commit them or pass --force"
+    fi
+    # Drop the env files wt put there so they don't count as local changes.
+    if [ -f "$sd/copied/$name" ]; then
+      local rel
+      while IFS= read -r rel; do
+        if ! git -C "$dir" ls-files --error-unmatch "$rel" >/dev/null 2>&1; then rm -f "$dir/$rel"; fi
+      done < "$sd/copied/$name"
+    fi
+    git -C "$root" worktree remove $force "$dir" \
+      || die "worktree has changes; commit them or pass --force"
+    info "removed $dir"
+  else
+    warn "$dir not found; cleaning up state only"
+    git -C "$root" worktree prune
+  fi
+  rm -f "$sd/claims/$name" "$sd/ports/$name" "$sd/copied/$name"
+  if [ "$delete" -eq 1 ]; then
+    git -C "$root" branch -D "$BRANCH_PREFIX$name" >/dev/null && info "deleted branch $BRANCH_PREFIX$name"
+  fi
+}
+
+main() {
+  local cmd="${1:-help}"; [ $# -gt 0 ] && shift
+  case "$cmd" in
+    new) cmd_new "$@";;
+    ls|list) cmd_ls;;
+    claim) cmd_claim "$@";;
+    claims) cmd_claims;;
+    check) cmd_check;;
+    rm|remove) cmd_rm "$@";;
+    path) [ $# -eq 1 ] || die "usage: wt path <name>"; valid_name "$1"; wt_path "$1"; printf '\n';;
+    version|-v|--version) printf 'wt %s\n' "$VERSION";;
+    help|-h|--help) usage;;
+    *) usage; exit 1;;
+  esac
+}
+
+main "$@"
